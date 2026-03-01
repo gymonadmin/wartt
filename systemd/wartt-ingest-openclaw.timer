@@ -1,0 +1,12 @@
+[Unit]
+Description=Run wartt OpenClaw ingestion every 10s
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=10s
+AccuracySec=1s
+Unit=wartt-ingest-openclaw.service
+
+[Install]
+WantedBy=timers.target
+

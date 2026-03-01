@@ -1,0 +1,9 @@
+[Unit]
+Description=wartt ingest OpenClaw logs
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/wartt ingest-openclaw --once
+WorkingDirectory=/opt/wartt
+

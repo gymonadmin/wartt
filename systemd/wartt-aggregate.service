@@ -1,0 +1,12 @@
+[Unit]
+Description=wartt latency aggregation
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ops
+Group=ops
+EnvironmentFile=-/opt/wartt/config/wartt.env
+ExecStart=/opt/wartt/bin/wartt rebuild --since ${WARTT_PERIODIC_SINCE}
+WorkingDirectory=/opt/wartt
+
