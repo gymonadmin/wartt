@@ -194,9 +194,13 @@ install_layout() {
     "${INSTALL_ROOT}/bin" \
     "${INSTALL_ROOT}/config"
 
-  as_root install -m 0755 "${SCRIPT_DIR}/bin/wartt" "${INSTALL_ROOT}/bin/wartt"
-  as_root cp -a "${SCRIPT_DIR}/config/." "${INSTALL_ROOT}/config/"
-  as_root install -m 0644 "${SCRIPT_DIR}/README.md" "${INSTALL_ROOT}/README.md"
+  if [[ "${SCRIPT_DIR}" -ef "${INSTALL_ROOT}" ]]; then
+    log "Install root matches repository dir; skipping file copy"
+  else
+    as_root install -m 0755 "${SCRIPT_DIR}/bin/wartt" "${INSTALL_ROOT}/bin/wartt"
+    as_root cp -a "${SCRIPT_DIR}/config/." "${INSTALL_ROOT}/config/"
+    as_root install -m 0644 "${SCRIPT_DIR}/README.md" "${INSTALL_ROOT}/README.md"
+  fi
   as_root ln -sf "${INSTALL_ROOT}/bin/wartt" "${BIN_LINK}"
 }
 

@@ -47,10 +47,16 @@ func migrate(db *sql.DB) error {
 // Safe to call on new (empty) databases — errors from non-existent tables are ignored.
 func migrateColumns(db *sql.DB) error {
 	for _, table := range []string{"events", "traces"} {
+		exists, err := tableExists(db, table)
+		if err != nil {
+			return fmt.Errorf("check table %s: %w", table, err)
+		}
+		if !exists {
+			continue
+		}
 		has, err := hasColumn(db, table, "channel")
 		if err != nil {
-			// Table may not exist yet on a fresh database; skip.
-			continue
+			return fmt.Errorf("check column %s.channel: %w", table, err)
 		}
 		if !has {
 			_, err = db.Exec(fmt.Sprintf(
@@ -62,6 +68,15 @@ func migrateColumns(db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+func tableExists(db *sql.DB, table string) (bool, error) {
+	var n int
+	err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 func hasColumn(db *sql.DB, table, col string) (bool, error) {
