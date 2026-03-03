@@ -31,7 +31,7 @@ func (a *App) loadData() tea.Cmd {
 
 func queryTail(db *sql.DB, limit int) ([]model.Trace, error) {
 	rows, err := db.Query(`
-		SELECT trace_id, time_eet, ts_unix_ms, message_type, status, message_preview,
+		SELECT trace_id, time_eet, ts_unix_ms, message_type, channel, status, message_preview,
 		       t1_inbound_gateway_eet, t2_stt_start_eet, t3_stt_end_eet,
 		       t4_llm_start_eet, t5_llm_end_eet, t6_outbound_send_eet,
 		       total_ms, queue_wait_ms, upload_ingest_ms, queue_before_stt_ms,
@@ -51,7 +51,7 @@ func queryTail(db *sql.DB, limit int) ([]model.Trace, error) {
 
 func querySummary(db *sql.DB) ([]summaryRow, error) {
 	rows, err := db.Query(`
-		SELECT message_type, status, total_ms
+		SELECT COALESCE(channel, 'whatsapp') || '/' || message_type AS label, status, total_ms
 		FROM traces
 		WHERE ts_unix_ms > (strftime('%s','now') - 86400) * 1000
 		ORDER BY ts_unix_ms ASC
@@ -69,16 +69,16 @@ func querySummary(db *sql.DB) ([]summaryRow, error) {
 	order := []string{}
 
 	for rows.Next() {
-		var msgType, status string
+		var label, status string
 		var totalMs sql.NullInt64
-		if err := rows.Scan(&msgType, &status, &totalMs); err != nil {
+		if err := rows.Scan(&label, &status, &totalMs); err != nil {
 			return nil, err
 		}
-		if _, ok := buckets[msgType]; !ok {
-			buckets[msgType] = &bucket{}
-			order = append(order, msgType)
+		if _, ok := buckets[label]; !ok {
+			buckets[label] = &bucket{}
+			order = append(order, label)
 		}
-		b := buckets[msgType]
+		b := buckets[label]
 		if totalMs.Valid && totalMs.Int64 > 0 {
 			b.totals = append(b.totals, totalMs.Int64)
 		}
@@ -131,9 +131,10 @@ func scanTraces(rows *sql.Rows) ([]model.Trace, error) {
 			downloadAudio, whisperTotal, transcribe           sql.NullInt64
 			toolCalls, llmTotal, llmLatency, overhead        sql.NullInt64
 			bottleneckMs                                      sql.NullInt64
+			channel                                           sql.NullString
 		)
 		err := rows.Scan(
-			&t.TraceID, &t.TimeEET, &t.TsUnixMs, &t.MessageType, &t.Status, &t.MessagePreview,
+			&t.TraceID, &t.TimeEET, &t.TsUnixMs, &t.MessageType, &channel, &t.Status, &t.MessagePreview,
 			&t.T1InboundGatewayEET, &t.T2SttStartEET, &t.T3SttEndEET,
 			&t.T4LlmStartEET, &t.T5LlmEndEET, &t.T6OutboundSendEET,
 			&totalMs, &queueWait, &uploadIngest, &queueBeforeStt,
@@ -143,6 +144,9 @@ func scanTraces(rows *sql.Rows) ([]model.Trace, error) {
 		)
 		if err != nil {
 			return nil, err
+		}
+		if channel.Valid {
+			t.Channel = channel.String
 		}
 		if totalMs.Valid {
 			t.TotalMs = totalMs.Int64

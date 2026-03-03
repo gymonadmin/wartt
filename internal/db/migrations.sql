@@ -7,7 +7,8 @@ CREATE TABLE IF NOT EXISTS events (
     mono_ns      INTEGER,
     status       TEXT,
     error_code   TEXT,
-    meta         TEXT
+    meta         TEXT,
+    channel      TEXT    DEFAULT 'whatsapp'
 );
 CREATE INDEX IF NOT EXISTS idx_events_trace ON events(trace_id);
 CREATE INDEX IF NOT EXISTS idx_events_ts    ON events(ts_unix_ms);
@@ -17,6 +18,7 @@ CREATE TABLE IF NOT EXISTS traces (
     time_eet              TEXT    NOT NULL,
     ts_unix_ms            INTEGER NOT NULL,
     message_type          TEXT    NOT NULL,
+    channel               TEXT    DEFAULT 'whatsapp',
     status                TEXT,
     message_preview       TEXT,
 

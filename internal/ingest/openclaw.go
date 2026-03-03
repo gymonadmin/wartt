@@ -172,8 +172,8 @@ func storeEvents(db *sql.DB, cfg *config.Config, events []model.Event) error {
 
 	stmt, err := tx.Prepare(`
 		INSERT OR IGNORE INTO events
-			(trace_id, message_type, stage, ts_unix_ms, status, meta)
-		VALUES (?, ?, ?, ?, ?, ?)
+			(trace_id, message_type, stage, ts_unix_ms, status, meta, channel)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -184,7 +184,7 @@ func storeEvents(db *sql.DB, cfg *config.Config, events []model.Event) error {
 	traceIDs := map[string]bool{}
 	for _, e := range events {
 		meta := metaJSON(e.Meta)
-		_, err := stmt.Exec(e.TraceID, e.MessageType, e.Stage, e.TsUnixMs, e.Status, meta)
+		_, err := stmt.Exec(e.TraceID, e.MessageType, e.Stage, e.TsUnixMs, e.Status, meta, e.Channel)
 		if err != nil {
 			return fmt.Errorf("insert event: %w", err)
 		}
@@ -216,7 +216,7 @@ func storeEvents(db *sql.DB, cfg *config.Config, events []model.Event) error {
 
 func loadTraceEvents(db *sql.DB, traceID string) ([]model.Event, error) {
 	rows, err := db.Query(`
-		SELECT trace_id, message_type, stage, ts_unix_ms, status, meta
+		SELECT trace_id, message_type, stage, ts_unix_ms, status, meta, channel
 		FROM events WHERE trace_id = ? ORDER BY ts_unix_ms ASC
 	`, traceID)
 	if err != nil {
@@ -228,7 +228,7 @@ func loadTraceEvents(db *sql.DB, traceID string) ([]model.Event, error) {
 	for rows.Next() {
 		var e model.Event
 		var metaStr string
-		if err := rows.Scan(&e.TraceID, &e.MessageType, &e.Stage, &e.TsUnixMs, &e.Status, &metaStr); err != nil {
+		if err := rows.Scan(&e.TraceID, &e.MessageType, &e.Stage, &e.TsUnixMs, &e.Status, &metaStr, &e.Channel); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(metaStr), &e.Meta)
@@ -240,17 +240,18 @@ func loadTraceEvents(db *sql.DB, traceID string) ([]model.Event, error) {
 func upsertTrace(db *sql.DB, t *model.Trace) error {
 	_, err := db.Exec(`
 		INSERT INTO traces (
-			trace_id, time_eet, ts_unix_ms, message_type, status, message_preview,
+			trace_id, time_eet, ts_unix_ms, message_type, channel, status, message_preview,
 			t1_inbound_gateway_eet, t2_stt_start_eet, t3_stt_end_eet,
 			t4_llm_start_eet, t5_llm_end_eet, t6_outbound_send_eet,
 			total_ms, queue_wait_ms, upload_ingest_ms, queue_before_stt_ms,
 			download_audio_ms, whisper_total_ms, transcribe_ms, tool_calls_ms,
 			llm_total_ms, llm_latency_ms, overhead_ms,
 			llm_model, latency_class, bottleneck_stage, bottleneck_ms
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(trace_id) DO UPDATE SET
 			time_eet=excluded.time_eet, ts_unix_ms=excluded.ts_unix_ms,
-			message_type=excluded.message_type, status=excluded.status,
+			message_type=excluded.message_type, channel=excluded.channel,
+			status=excluded.status,
 			message_preview=excluded.message_preview,
 			t1_inbound_gateway_eet=excluded.t1_inbound_gateway_eet,
 			t2_stt_start_eet=excluded.t2_stt_start_eet,
@@ -271,7 +272,7 @@ func upsertTrace(db *sql.DB, t *model.Trace) error {
 			bottleneck_stage=excluded.bottleneck_stage,
 			bottleneck_ms=excluded.bottleneck_ms
 	`,
-		t.TraceID, t.TimeEET, t.TsUnixMs, t.MessageType, t.Status, t.MessagePreview,
+		t.TraceID, t.TimeEET, t.TsUnixMs, t.MessageType, t.Channel, t.Status, t.MessagePreview,
 		t.T1InboundGatewayEET, t.T2SttStartEET, t.T3SttEndEET,
 		t.T4LlmStartEET, t.T5LlmEndEET, t.T6OutboundSendEET,
 		t.TotalMs, t.QueueWaitMs, t.UploadIngestMs, t.QueueBeforeSttMs,
@@ -357,7 +358,7 @@ func parseTimeMs(t string) int64 {
 
 var (
 	reLaneDequeue   = regexp.MustCompile(`lane dequeue:.*waitMs=(\d+)`)
-	reRunStart      = regexp.MustCompile(`embedded run start: runId=([0-9a-fA-F-]+).*messageChannel=whatsapp`)
+	reRunStart      = regexp.MustCompile(`embedded run start: runId=([0-9a-fA-F-]+).*messageChannel=(\w+)`)
 	reRunProvider   = regexp.MustCompile(`provider=(\S+)`)
 	reRunModel      = regexp.MustCompile(`model=(\S+)`)
 	rePromptStart   = regexp.MustCompile(`embedded run prompt start: runId=([0-9a-fA-F-]+)`)
@@ -389,6 +390,7 @@ type runState struct {
 	provider string
 	model    string
 	msgType  string
+	channel  string
 	preview  string
 	isError  bool
 }
@@ -486,7 +488,7 @@ func parseStream(r io.Reader) ([]model.Event, error) {
 	// Per-run state
 	runs := map[string]*runState{}
 
-	emit := func(traceID, msgType, stage string, ts int64, status, toolName, provider, llmModel string, clientSendMs int64, preview string) {
+	emit := func(traceID, msgType, channel, stage string, ts int64, status, toolName, provider, llmModel string, clientSendMs int64, preview string) {
 		if traceID == "" || ts <= 0 || stage == "" {
 			return
 		}
@@ -496,6 +498,7 @@ func parseStream(r io.Reader) ([]model.Event, error) {
 		e := model.Event{
 			TraceID:     traceID,
 			MessageType: msgType,
+			Channel:     channel,
 			Stage:       stage,
 			TsUnixMs:    ts,
 			Status:      status,
@@ -560,9 +563,10 @@ func parseStream(r io.Reader) ([]model.Event, error) {
 			continue
 		}
 
-		// Embedded run start
-		if m := reRunStart.FindStringSubmatch(msg); len(m) > 1 {
+		// Embedded run start — group 1 = runId, group 2 = channel
+		if m := reRunStart.FindStringSubmatch(msg); len(m) > 2 {
 			runID := m[1]
+			channel := m[2]
 			provider := ""
 			llmModel := ""
 			if pm := reRunProvider.FindStringSubmatch(msg); len(pm) > 1 {
@@ -610,11 +614,12 @@ func parseStream(r io.Reader) ([]model.Event, error) {
 				provider: provider,
 				model:    llmModel,
 				msgType:  runType,
+				channel:  channel,
 				preview:  inboundPreview,
 			}
 
-			emit(runID, runType, "inbound_event_received", inboundTs, "", "", provider, llmModel, inboundClientTs, inboundPreview)
-			emit(runID, runType, "processing_start", ts, "", "", provider, llmModel, 0, "")
+			emit(runID, runType, channel, "inbound_event_received", inboundTs, "", "", provider, llmModel, inboundClientTs, inboundPreview)
+			emit(runID, runType, channel, "processing_start", ts, "", "", provider, llmModel, 0, "")
 			continue
 		}
 
@@ -625,7 +630,7 @@ func parseStream(r io.Reader) ([]model.Event, error) {
 			if rs == nil {
 				continue
 			}
-			emit(runID, rs.msgType, "llm_start", ts, "", "", rs.provider, rs.model, 0, "")
+			emit(runID, rs.msgType, rs.channel, "llm_start", ts, "", "", rs.provider, rs.model, 0, "")
 			continue
 		}
 
@@ -636,7 +641,7 @@ func parseStream(r io.Reader) ([]model.Event, error) {
 			if rs == nil {
 				continue
 			}
-			emit(runID, rs.msgType, "llm_end", ts, "", "", rs.provider, rs.model, 0, "")
+			emit(runID, rs.msgType, rs.channel, "llm_end", ts, "", "", rs.provider, rs.model, 0, "")
 			continue
 		}
 
@@ -648,7 +653,7 @@ func parseStream(r io.Reader) ([]model.Event, error) {
 			if rs == nil {
 				continue
 			}
-			emit(runID, rs.msgType, "tool_call_start", ts, "", tool, rs.provider, rs.model, 0, "")
+			emit(runID, rs.msgType, rs.channel, "tool_call_start", ts, "", tool, rs.provider, rs.model, 0, "")
 			continue
 		}
 
@@ -660,7 +665,7 @@ func parseStream(r io.Reader) ([]model.Event, error) {
 			if rs == nil {
 				continue
 			}
-			emit(runID, rs.msgType, "tool_call_end", ts, "", tool, rs.provider, rs.model, 0, "")
+			emit(runID, rs.msgType, rs.channel, "tool_call_end", ts, "", tool, rs.provider, rs.model, 0, "")
 			continue
 		}
 
@@ -687,7 +692,7 @@ func parseStream(r io.Reader) ([]model.Event, error) {
 			} else if aborted {
 				status = "timeout"
 			}
-			emit(runID, rs.msgType, "response_sent", ts, status, "", rs.provider, rs.model, 0, "")
+			emit(runID, rs.msgType, rs.channel, "response_sent", ts, status, "", rs.provider, rs.model, 0, "")
 			delete(runs, runID)
 			continue
 		}

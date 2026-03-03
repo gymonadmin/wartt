@@ -37,6 +37,7 @@ func (a *Aggregator) Aggregate(traceID string, events []model.Event) *model.Trac
 		toolSumMs    int64
 		toolCurStart int64
 		msgType      = "text"
+		channel      string
 		llmModel     string
 		status       string
 		clientSendMs int64
@@ -46,6 +47,9 @@ func (a *Aggregator) Aggregate(traceID string, events []model.Event) *model.Trac
 	for _, e := range events {
 		if e.MessageType != "" {
 			msgType = e.MessageType
+		}
+		if e.Channel != "" {
+			channel = e.Channel
 		}
 		if e.Meta.LLMModel != "" {
 			llmModel = e.Meta.LLMModel
@@ -183,6 +187,7 @@ func (a *Aggregator) Aggregate(traceID string, events []model.Event) *model.Trac
 		TimeEET:        fmtTs(inboundMs),
 		TsUnixMs:       inboundMs,
 		MessageType:    msgType,
+		Channel:        channel,
 		Status:         status,
 		MessagePreview: preview,
 

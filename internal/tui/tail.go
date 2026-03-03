@@ -9,11 +9,11 @@ import (
 	"wartt/internal/model"
 )
 
-// columnDefs defines the 16 table columns. The sort indicator is shown in
-// the header bar, not here, so widths stay fixed.
+// columnDefs defines the table columns.
 var columnDefs = []table.Column{
 	{Title: "TIME", Width: 10},
 	{Title: "TYPE", Width: 5},
+	{Title: "CHAN", Width: 9},
 	{Title: "STATUS", Width: 7},
 	{Title: "CLASS", Width: 8},
 	{Title: "TOTAL", Width: 7},
@@ -52,6 +52,7 @@ func traceToRow(t model.Trace) table.Row {
 	return table.Row{
 		t.TimeEET,
 		t.MessageType,
+		t.Channel,
 		t.Status,
 		t.LatencyClass,
 		totalStr,
@@ -90,32 +91,34 @@ func compareByCol(a, b model.Trace, col int) bool {
 	case 1:
 		return a.MessageType < b.MessageType
 	case 2:
-		return a.Status < b.Status
+		return a.Channel < b.Channel
 	case 3:
-		return a.LatencyClass < b.LatencyClass
+		return a.Status < b.Status
 	case 4:
-		return a.TotalMs < b.TotalMs
+		return a.LatencyClass < b.LatencyClass
 	case 5:
-		return a.BottleneckStage < b.BottleneckStage
+		return a.TotalMs < b.TotalMs
 	case 6:
-		return a.BottleneckMs < b.BottleneckMs
+		return a.BottleneckStage < b.BottleneckStage
 	case 7:
-		return a.QueueWaitMs < b.QueueWaitMs
+		return a.BottleneckMs < b.BottleneckMs
 	case 8:
-		return a.DownloadAudioMs < b.DownloadAudioMs
+		return a.QueueWaitMs < b.QueueWaitMs
 	case 9:
-		return a.TranscribeMs < b.TranscribeMs
+		return a.DownloadAudioMs < b.DownloadAudioMs
 	case 10:
-		return a.LLMTotalMs < b.LLMTotalMs
+		return a.TranscribeMs < b.TranscribeMs
 	case 11:
-		return a.OverheadMs < b.OverheadMs
+		return a.LLMTotalMs < b.LLMTotalMs
 	case 12:
-		return a.UploadIngestMs < b.UploadIngestMs
+		return a.OverheadMs < b.OverheadMs
 	case 13:
-		return a.QueueBeforeSttMs < b.QueueBeforeSttMs
+		return a.UploadIngestMs < b.UploadIngestMs
 	case 14:
-		return a.WhisperTotalMs < b.WhisperTotalMs
+		return a.QueueBeforeSttMs < b.QueueBeforeSttMs
 	case 15:
+		return a.WhisperTotalMs < b.WhisperTotalMs
+	case 16:
 		return a.LLMLatencyMs < b.LLMLatencyMs
 	default:
 		return a.TsUnixMs < b.TsUnixMs

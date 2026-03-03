@@ -45,6 +45,7 @@ func renderDetail(t *model.Trace, width int) string {
 	lines := []string{
 		row("Time:", t.T1InboundGatewayEET),
 		row("Type:", t.MessageType+"   Status: "+t.Status),
+		row("Channel:", valueIfElse(t.Channel, "-")),
 		row("Message:", `"`+preview+`"`),
 		row("Model:", valueIfElse(t.LLMModel, "-")),
 		strings.Repeat("─", innerWidth),

@@ -4,6 +4,7 @@ package model
 type Event struct {
 	TraceID     string
 	MessageType string // text | voice
+	Channel     string // "whatsapp", "discord", "slack", etc.
 	Stage       string
 	TsUnixMs    int64
 	Status      string
@@ -25,6 +26,7 @@ type Trace struct {
 	TimeEET         string
 	TsUnixMs        int64
 	MessageType     string // text | voice
+	Channel         string // "whatsapp", "discord", "slack", etc.
 	Status          string // ok | error | timeout | partial
 	MessagePreview  string
 
