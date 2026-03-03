@@ -102,6 +102,10 @@ func IngestOnce(db *sql.DB, cfg *config.Config, sourceFile string) error {
 	if err != nil {
 		return fmt.Errorf("read state: %w", err)
 	}
+	minTs := int64(0)
+	if state.Path == sourceFile && state.Inode == localInode {
+		minTs = lastIngestedTs(db)
+	}
 
 	// Determine start offset
 	startByte := int64(0)
@@ -132,10 +136,13 @@ func IngestOnce(db *sql.DB, cfg *config.Config, sourceFile string) error {
 	if err != nil {
 		return fmt.Errorf("parse stream: %w", err)
 	}
+	sessionEvents, err := parseDiscordSessionEvents(minTs)
+	if err == nil && len(sessionEvents) > 0 {
+		events = append(events, sessionEvents...)
+	}
 
 	// Filter to only new events if we have state
 	if state.Path == sourceFile && state.Inode == localInode {
-		minTs := lastIngestedTs(db)
 		filtered := events[:0]
 		for _, e := range events {
 			if e.TsUnixMs > minTs {
@@ -297,6 +304,7 @@ func metaJSON(m model.EventMeta) string {
 // logLine represents one parsed JSON line from an OpenClaw log.
 type logLine struct {
 	tsUnixMs int64
+	source   string // "0" field — source JSON/name
 	msg      string // "1" field — message JSON or description text
 	desc     string // "2" field — log description
 }
@@ -321,9 +329,10 @@ func parseLogLine(raw []byte) (*logLine, bool) {
 	if ts <= 0 {
 		return nil, false
 	}
+	source := jsonFieldToString(r.F0)
 	msg := jsonFieldToString(r.F1)
 	desc := jsonFieldToString(r.F2)
-	return &logLine{tsUnixMs: ts, msg: msg, desc: desc}, true
+	return &logLine{tsUnixMs: ts, source: source, msg: msg, desc: desc}, true
 }
 
 func jsonFieldToString(raw json.RawMessage) string {
@@ -340,8 +349,10 @@ func jsonFieldToString(raw json.RawMessage) string {
 }
 
 func parseTimeMs(t string) int64 {
-	// Try ISO8601 with sub-second: 2006-01-02T15:04:05.999Z
+	// Accept both Z and explicit timezone offsets.
 	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
 		"2006-01-02T15:04:05.999999999Z",
 		"2006-01-02T15:04:05.999Z",
 		"2006-01-02T15:04:05Z",
@@ -357,28 +368,38 @@ func parseTimeMs(t string) int64 {
 // ─── State machine for parsing ───────────────────────────────────────────────
 
 var (
-	reLaneDequeue   = regexp.MustCompile(`lane dequeue:.*waitMs=(\d+)`)
-	reRunStart      = regexp.MustCompile(`embedded run start: runId=([0-9a-fA-F-]+).*messageChannel=(\w+)`)
-	reRunProvider   = regexp.MustCompile(`provider=(\S+)`)
-	reRunModel      = regexp.MustCompile(`model=(\S+)`)
-	rePromptStart   = regexp.MustCompile(`embedded run prompt start: runId=([0-9a-fA-F-]+)`)
-	rePromptEnd     = regexp.MustCompile(`embedded run prompt end: runId=([0-9a-fA-F-]+)`)
-	reToolStart     = regexp.MustCompile(`embedded run tool start: runId=([0-9a-fA-F-]+).*tool=(\S+)`)
-	reToolEnd       = regexp.MustCompile(`embedded run tool end: runId=([0-9a-fA-F-]+).*tool=(\S+)`)
-	reAgentEnd      = regexp.MustCompile(`embedded run agent end: runId=([0-9a-fA-F-]+) isError=(true|false)`)
-	reRunDone       = regexp.MustCompile(`embedded run done: runId=([0-9a-fA-F-]+).*aborted=(true|false)`)
+	reLaneDequeue      = regexp.MustCompile(`lane dequeue:.*waitMs=(\d+)`)
+	reRunStart         = regexp.MustCompile(`embedded run start: runId=([0-9a-fA-F-]+).*messageChannel=(\w+)`)
+	reRunProvider      = regexp.MustCompile(`provider=(\S+)`)
+	reRunModel         = regexp.MustCompile(`model=(\S+)`)
+	rePromptStart      = regexp.MustCompile(`embedded run prompt start: runId=([0-9a-fA-F-]+)`)
+	rePromptEnd        = regexp.MustCompile(`embedded run prompt end: runId=([0-9a-fA-F-]+)`)
+	reToolStart        = regexp.MustCompile(`embedded run tool start: runId=([0-9a-fA-F-]+).*tool=(\S+)`)
+	reToolEnd          = regexp.MustCompile(`embedded run tool end: runId=([0-9a-fA-F-]+).*tool=(\S+)`)
+	reAgentEnd         = regexp.MustCompile(`embedded run agent end: runId=([0-9a-fA-F-]+) isError=(true|false)`)
+	reRunDone          = regexp.MustCompile(`embedded run done: runId=([0-9a-fA-F-]+).*aborted=(true|false)`)
+	reModuleInSrc      = regexp.MustCompile(`(?i)"module":"([^"]+)"`)
+	reSubsystemInSrc   = regexp.MustCompile(`(?i)"subsystem":"([^"]+)"`)
+	reRunIDInSrc       = regexp.MustCompile(`(?i)"runid":"([0-9a-fA-F-]+)"`)
+	reDiscordChanID    = regexp.MustCompile(`(?i)"channelid":"([^"]+)"`)
+	reDiscordInbVb     = regexp.MustCompile(`(?i)discord inbound:.*preview="([^"]*)"`)
+	reDiscordDelVb     = regexp.MustCompile(`(?i)discord:\s+delivered\s+\d+\s+repl(?:y|ies)\s+to\s+(\S+)`)
+	reDiscordMsgCreate = regexp.MustCompile(`(?i)"event":"message_create"`)
 
-	reMediaType  = regexp.MustCompile(`(?i)"mediatype":"([^"]+)"`)
-	reMediaKind  = regexp.MustCompile(`(?i)"mediakind":"([^"]+)"`)
-	reMediaPath  = regexp.MustCompile(`(?i)"mediapath":"[^"]+\.(ogg|opus|mp3|wav|m4a)"`)
-	reMediaTag   = regexp.MustCompile(`(?i)<media:\s*(audio|voice)>`)
-	reTimestamp  = regexp.MustCompile(`"timestamp":\s*(\d{10,13})`)
-	reBodyText   = regexp.MustCompile(`"body":"([^"]*)"`)
-	reTextField  = regexp.MustCompile(`"text":"([^"]*)"`)
-	reMediaTypeG = regexp.MustCompile(`(?i)"mediatype":"([^"]+)"`)
+	reMediaType     = regexp.MustCompile(`(?i)"mediatype":"([^"]+)"`)
+	reMediaKind     = regexp.MustCompile(`(?i)"mediakind":"([^"]+)"`)
+	reMediaPath     = regexp.MustCompile(`(?i)"mediapath":"[^"]+\.(ogg|opus|mp3|wav|m4a)"`)
+	reMediaTag      = regexp.MustCompile(`(?i)<media:\s*(audio|voice)>`)
+	reTimestamp     = regexp.MustCompile(`"timestamp":\s*(\d{10,13})`)
+	reBodyText      = regexp.MustCompile(`"body":"([^"]*)"`)
+	reTextField     = regexp.MustCompile(`"text":"([^"]*)"`)
+	reMediaTypeG    = regexp.MustCompile(`(?i)"mediatype":"([^"]+)"`)
+	reCorrelationID = regexp.MustCompile(`(?i)"correlationid":"([^"]+)"`)
+	reDiscordMsgID  = regexp.MustCompile(`(?i)"message_id"\s*:\s*"([^"]+)"`)
 )
 
 type inboundEntry struct {
+	traceID  string
 	ts       int64
 	msgType  string
 	clientTs int64
@@ -471,11 +492,64 @@ func extractMessagePreview(msg string) string {
 	return raw
 }
 
+func extractModuleAndRunID(source string) (module, runID string) {
+	if m := reModuleInSrc.FindStringSubmatch(source); len(m) > 1 {
+		module = strings.ToLower(m[1])
+	}
+	if m := reRunIDInSrc.FindStringSubmatch(source); len(m) > 1 {
+		runID = m[1]
+	}
+	return module, runID
+}
+
+func extractSubsystem(source string) string {
+	if m := reSubsystemInSrc.FindStringSubmatch(source); len(m) > 1 {
+		return strings.ToLower(m[1])
+	}
+	return ""
+}
+
+func channelFromModule(module string) string {
+	switch {
+	case strings.HasPrefix(module, "web-"):
+		return "whatsapp"
+	case strings.HasPrefix(module, "discord-"):
+		return "discord"
+	default:
+		return ""
+	}
+}
+
+func extractDiscordChannelID(msg string) string {
+	if m := reDiscordChanID.FindStringSubmatch(msg); len(m) > 1 {
+		return m[1]
+	}
+	return ""
+}
+
+func extractCorrelationID(msg string) string {
+	if m := reCorrelationID.FindStringSubmatch(msg); len(m) > 1 {
+		return strings.ToLower(m[1])
+	}
+	return ""
+}
+
+func composeTraceID(runID, msg string) string {
+	if runID == "" {
+		return ""
+	}
+	if corr := extractCorrelationID(msg); corr != "" {
+		return runID + ":" + corr
+	}
+	return runID
+}
+
 func parseStream(r io.Reader) ([]model.Event, error) {
 	var events []model.Event
 
 	// Inbound tracking
 	inbounds := make([]inboundEntry, 0, 128)
+	discordInbounds := make([]inboundEntry, 0, 64)
 
 	// Pending state
 	var pendingClientTs int64
@@ -526,8 +600,74 @@ func parseStream(r io.Reader) ([]model.Event, error) {
 			continue
 		}
 		ts := ll.tsUnixMs
+		source := ll.source
 		msg := ll.msg
 		desc := ll.desc
+		module, sourceRunID := extractModuleAndRunID(source)
+		subsystem := extractSubsystem(source)
+		lowerMsg := strings.ToLower(msg)
+
+		// Newer OpenClaw streams can emit discord preflight skips without embedded traces.
+		// Surface them as short traces so channel activity is visible in wartt.
+		if strings.HasPrefix(desc, "discord: skipping ") {
+			traceID := sourceRunID
+			if traceID == "" {
+				traceID = fmt.Sprintf("discord-skip-%d-%s", ts, extractDiscordChannelID(msg))
+			}
+			emit(traceID, "text", "discord", "inbound_event_received", ts, "", "", "", "", 0, desc)
+			emit(traceID, "text", "discord", "response_sent", ts, "ok", "", "", "", 0, "")
+			continue
+		}
+
+		// Fallback for Discord traffic when only monitor events are visible in info logs.
+		if subsystem == "discord/monitor" && desc == "Slow listener detected" && reDiscordMsgCreate.MatchString(msg) {
+			traceID := fmt.Sprintf("discord-monitor-%d", ts)
+			emit(traceID, "text", "discord", "inbound_event_received", ts, "", "", "", "", 0, "discord MESSAGE_CREATE")
+			emit(traceID, "text", "discord", "processing_start", ts, "", "", "", "", 0, "")
+			continue
+		}
+
+		// Successful Discord auto-reply logs are often emitted only in verbose mode and
+		// don't include run IDs; synthesize traces from inbound/delivered verbose lines.
+		if strings.Contains(lowerMsg, "discord inbound:") {
+			traceID := fmt.Sprintf("discord-vb-%d", ts)
+			preview := ""
+			if m := reDiscordInbVb.FindStringSubmatch(msg); len(m) > 1 {
+				preview = strings.ReplaceAll(m[1], ",", ";")
+			}
+			entry := inboundEntry{
+				traceID: traceID,
+				ts:      ts,
+				msgType: "text",
+				preview: preview,
+			}
+			discordInbounds = append(discordInbounds, entry)
+			emit(traceID, "text", "discord", "inbound_event_received", ts, "", "", "", "", 0, preview)
+			emit(traceID, "text", "discord", "processing_start", ts, "", "", "", "", 0, "")
+			continue
+		}
+		if strings.Contains(lowerMsg, "discord: delivered ") && reDiscordDelVb.MatchString(msg) {
+			matched := false
+			for i := len(discordInbounds) - 1; i >= 0 && i >= len(discordInbounds)-60; i-- {
+				if discordInbounds[i].used {
+					continue
+				}
+				delta := ts - discordInbounds[i].ts
+				if delta < 0 || delta > 120000 {
+					continue
+				}
+				discordInbounds[i].used = true
+				emit(discordInbounds[i].traceID, "text", "discord", "response_sent", ts, "ok", "", "", "", 0, "")
+				matched = true
+				break
+			}
+			if !matched {
+				traceID := fmt.Sprintf("discord-vb-%d", ts)
+				emit(traceID, "text", "discord", "inbound_event_received", ts, "", "", "", "", 0, "")
+				emit(traceID, "text", "discord", "response_sent", ts, "ok", "", "", "", 0, "")
+			}
+			continue
+		}
 
 		switch desc {
 		case "inbound web message":
@@ -546,6 +686,24 @@ func parseStream(r io.Reader) ([]model.Event, error) {
 				clientTs: clientTs,
 				preview:  preview,
 			})
+			if sourceRunID != "" {
+				traceID := composeTraceID(sourceRunID, msg)
+				if traceID == "" {
+					traceID = sourceRunID
+				}
+				channel := channelFromModule(module)
+				if channel == "" {
+					channel = "whatsapp"
+				}
+				msgType := detectMessageType(msg)
+				runs[traceID] = &runState{
+					msgType: msgType,
+					channel: channel,
+					preview: preview,
+				}
+				emit(traceID, msgType, channel, "inbound_event_received", ts, "", "", "", "", clientTs, preview)
+				emit(traceID, msgType, channel, "processing_start", ts, "", "", "", "", 0, "")
+			}
 			continue
 
 		case "inbound message":
@@ -553,6 +711,32 @@ func parseStream(r io.Reader) ([]model.Event, error) {
 			pendingClientSeenTs = ts
 			pendingPreview = extractMessagePreview(msg)
 			pendingPreviewSeenTs = ts
+			continue
+
+		case "auto-reply sent (text)", "auto-reply sent (media)", "auto-reply sent (voice)":
+			if sourceRunID == "" {
+				continue
+			}
+			traceID := composeTraceID(sourceRunID, msg)
+			if traceID == "" {
+				traceID = sourceRunID
+			}
+			rs := runs[traceID]
+			msgType := detectMessageType(msg)
+			channel := channelFromModule(module)
+			if rs != nil {
+				if rs.msgType != "" {
+					msgType = rs.msgType
+				}
+				if rs.channel != "" {
+					channel = rs.channel
+				}
+			}
+			if channel == "" {
+				channel = "whatsapp"
+			}
+			emit(traceID, msgType, channel, "response_sent", ts, "ok", "", "", "", 0, "")
+			delete(runs, traceID)
 			continue
 		}
 
@@ -699,6 +883,204 @@ func parseStream(r io.Reader) ([]model.Event, error) {
 	}
 
 	return events, scanner.Err()
+}
+
+type ocSessionIndexEntry struct {
+	SessionFile string `json:"sessionFile"`
+	LastChannel string `json:"lastChannel"`
+}
+
+type ocSessionLine struct {
+	Type      string `json:"type"`
+	Timestamp string `json:"timestamp"`
+	Message   struct {
+		Role      string `json:"role"`
+		Timestamp int64  `json:"timestamp"`
+		Content   []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	} `json:"message"`
+}
+
+func parseDiscordSessionEvents(minTs int64) ([]model.Event, error) {
+	stateDir := resolveOpenClawStateDir()
+	if stateDir == "" {
+		return nil, fmt.Errorf("openclaw state dir not found")
+	}
+	indexPaths, err := filepath.Glob(filepath.Join(stateDir, "agents", "*", "sessions", "sessions.json"))
+	if err != nil || len(indexPaths) == 0 {
+		return nil, fmt.Errorf("no openclaw session indexes found")
+	}
+
+	events := make([]model.Event, 0, 128)
+	for _, indexPath := range indexPaths {
+		data, err := os.ReadFile(indexPath)
+		if err != nil {
+			continue
+		}
+		var idx map[string]json.RawMessage
+		if err := json.Unmarshal(data, &idx); err != nil {
+			continue
+		}
+		baseDir := filepath.Dir(indexPath)
+		for _, raw := range idx {
+			var entry ocSessionIndexEntry
+			if err := json.Unmarshal(raw, &entry); err != nil {
+				continue
+			}
+			if entry.LastChannel != "discord" || entry.SessionFile == "" {
+				continue
+			}
+			sessionPath := entry.SessionFile
+			if !filepath.IsAbs(sessionPath) {
+				sessionPath = filepath.Join(baseDir, sessionPath)
+			}
+			ev, err := parseDiscordSessionFile(sessionPath, minTs)
+			if err != nil {
+				continue
+			}
+			events = append(events, ev...)
+		}
+	}
+	return events, nil
+}
+
+func resolveOpenClawStateDir() string {
+	if v := strings.TrimSpace(os.Getenv("OPENCLAW_STATE_DIR")); v != "" {
+		return v
+	}
+	if cfgPath := strings.TrimSpace(os.Getenv("OPENCLAW_CONFIG_PATH")); cfgPath != "" {
+		return filepath.Dir(cfgPath)
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".openclaw")
+	}
+	return ""
+}
+
+func parseDiscordSessionFile(path string, minTs int64) ([]model.Event, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	events := make([]model.Event, 0, 32)
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1024*1024), 32*1024*1024)
+
+	type pendingInbound struct {
+		traceID string
+		ts      int64
+	}
+	var pending *pendingInbound
+
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+
+		var rec ocSessionLine
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue
+		}
+		if rec.Type != "message" {
+			continue
+		}
+
+		ts := rec.Message.Timestamp
+		if ts <= 0 {
+			ts = parseTimeMs(rec.Timestamp)
+		}
+		if ts <= minTs {
+			continue
+		}
+
+		text := extractSessionText(rec.Message.Content)
+		if text == "" {
+			continue
+		}
+
+		switch rec.Message.Role {
+		case "user":
+			preview := extractDiscordUserPreview(text)
+			if preview == "" {
+				continue
+			}
+			traceID := "discord-session-" + extractDiscordSessionMessageID(text, ts)
+			events = append(events,
+				model.Event{
+					TraceID:     traceID,
+					MessageType: "text",
+					Channel:     "discord",
+					Stage:       "inbound_event_received",
+					TsUnixMs:    ts,
+					Meta: model.EventMeta{
+						MessagePreview: preview,
+					},
+				},
+				model.Event{
+					TraceID:     traceID,
+					MessageType: "text",
+					Channel:     "discord",
+					Stage:       "processing_start",
+					TsUnixMs:    ts,
+				},
+			)
+			pending = &pendingInbound{traceID: traceID, ts: ts}
+		case "assistant":
+			if pending == nil || ts < pending.ts {
+				continue
+			}
+			events = append(events, model.Event{
+				TraceID:     pending.traceID,
+				MessageType: "text",
+				Channel:     "discord",
+				Stage:       "response_sent",
+				TsUnixMs:    ts,
+				Status:      "ok",
+			})
+			pending = nil
+		}
+	}
+
+	return events, sc.Err()
+}
+
+func extractSessionText(content []struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}) string {
+	for _, c := range content {
+		if c.Type == "text" && c.Text != "" {
+			return c.Text
+		}
+	}
+	return ""
+}
+
+func extractDiscordUserPreview(raw string) string {
+	const marker = "```json\n\n"
+	if i := strings.LastIndex(raw, marker); i >= 0 {
+		tail := strings.TrimSpace(raw[i+len(marker):])
+		if tail != "" {
+			return strings.ReplaceAll(tail, ",", ";")
+		}
+	}
+	lines := strings.Split(strings.TrimSpace(raw), "\n")
+	if len(lines) == 0 {
+		return ""
+	}
+	return strings.ReplaceAll(strings.TrimSpace(lines[len(lines)-1]), ",", ";")
+}
+
+func extractDiscordSessionMessageID(raw string, ts int64) string {
+	if m := reDiscordMsgID.FindStringSubmatch(raw); len(m) > 1 {
+		return m[1]
+	}
+	return strconv.FormatInt(ts, 10)
 }
 
 // inodeFromFileInfo extracts the inode number from os.FileInfo.

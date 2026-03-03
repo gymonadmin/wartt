@@ -15,18 +15,27 @@ type tracesLoadedMsg struct {
 	summary []summaryRow
 }
 
-func (a *App) loadData() tea.Cmd {
+func (a *App) refreshData() tea.Cmd {
 	return func() tea.Msg {
-		traces, err := queryTail(a.db, 200)
-		if err != nil {
-			return errMsg{err}
+		if a.autoIngest && a.ingestFn != nil {
+			if err := a.ingestFn(); err != nil {
+				return errMsg{err}
+			}
 		}
-		summary, err := querySummary(a.db)
-		if err != nil {
-			return errMsg{err}
-		}
-		return tracesLoadedMsg{traces: traces, summary: summary}
+		return loadDataMsg(a.db)
 	}
+}
+
+func loadDataMsg(db *sql.DB) tea.Msg {
+	traces, err := queryTail(db, 200)
+	if err != nil {
+		return errMsg{err}
+	}
+	summary, err := querySummary(db)
+	if err != nil {
+		return errMsg{err}
+	}
+	return tracesLoadedMsg{traces: traces, summary: summary}
 }
 
 func queryTail(db *sql.DB, limit int) ([]model.Trace, error) {
@@ -128,10 +137,10 @@ func scanTraces(rows *sql.Rows) ([]model.Trace, error) {
 		var t model.Trace
 		var (
 			totalMs, queueWait, uploadIngest, queueBeforeStt sql.NullInt64
-			downloadAudio, whisperTotal, transcribe           sql.NullInt64
+			downloadAudio, whisperTotal, transcribe          sql.NullInt64
 			toolCalls, llmTotal, llmLatency, overhead        sql.NullInt64
-			bottleneckMs                                      sql.NullInt64
-			channel                                           sql.NullString
+			bottleneckMs                                     sql.NullInt64
+			channel                                          sql.NullString
 		)
 		err := rows.Scan(
 			&t.TraceID, &t.TimeEET, &t.TsUnixMs, &t.MessageType, &channel, &t.Status, &t.MessagePreview,

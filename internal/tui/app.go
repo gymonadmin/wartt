@@ -24,18 +24,20 @@ type errMsg struct{ err error }
 
 // App is the root bubbletea model.
 type App struct {
-	db        *sql.DB
-	table     table.Model
-	rawTraces []model.Trace // as loaded from DB (time DESC)
-	traces    []model.Trace // sorted view used by the table and detail overlay
-	summary   []summaryRow
-	detail    *model.Trace
-	sortCol   int  // index into columnDefs; 0 = TIME
-	sortAsc   bool // false = descending (default: newest first)
-	width     int
-	height    int
-	err       error
-	ready     bool
+	db         *sql.DB
+	ingestFn   func() error
+	autoIngest bool
+	table      table.Model
+	rawTraces  []model.Trace // as loaded from DB (time DESC)
+	traces     []model.Trace // sorted view used by the table and detail overlay
+	summary    []summaryRow
+	detail     *model.Trace
+	sortCol    int  // index into columnDefs; 0 = TIME
+	sortAsc    bool // false = descending (default: newest first)
+	width      int
+	height     int
+	err        error
+	ready      bool
 }
 
 type summaryRow struct {
@@ -47,8 +49,8 @@ type summaryRow struct {
 	P99    int64
 }
 
-func NewApp(db *sql.DB) *App {
-	return &App{db: db}
+func NewApp(db *sql.DB, ingestFn func() error, autoIngest bool) *App {
+	return &App{db: db, ingestFn: ingestFn, autoIngest: autoIngest}
 }
 
 func (a *App) Init() tea.Cmd {
@@ -68,15 +70,16 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.height = msg.Height
 		a.rebuildTable()
 		a.ready = true
-		return a, a.loadData()
+		return a, a.refreshData()
 
 	case tickMsg:
-		return a, tea.Batch(tick(), a.loadData())
+		return a, tea.Batch(tick(), a.refreshData())
 
 	case tracesLoadedMsg:
 		a.rawTraces = msg.traces
 		a.summary = msg.summary
 		a.rebuildTable()
+		a.err = nil
 		return a, nil
 
 	case errMsg:
@@ -96,7 +99,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, tea.Quit
 
 		case "r":
-			return a, a.loadData()
+			return a, a.refreshData()
 
 		case "<", ",":
 			if a.sortCol > 0 {
@@ -137,7 +140,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (a *App) View() string {
 	if !a.ready {
-		return "Loading…"
+		return "Loading..."
 	}
 
 	header := a.renderHeader()
@@ -168,7 +171,11 @@ func (a *App) renderHeader() string {
 	}
 	title := titleStyle.Render("WARTT")
 	sortInfo := sortStyle.Render(fmt.Sprintf("  sort:%s%s", columnDefs[a.sortCol].Title, dir))
-	hints := hintStyle.Render("<> col  s:dir  Enter:detail  r:refresh  q:quit")
+	ingestMode := "off"
+	if a.autoIngest {
+		ingestMode = "on"
+	}
+	hints := hintStyle.Render(fmt.Sprintf("ingest:%s  <> col  s:dir  Enter:detail  r:refresh  q:quit", ingestMode))
 
 	left := lipgloss.JoinHorizontal(lipgloss.Top, title, sortInfo)
 	padding := a.width - lipgloss.Width(left) - lipgloss.Width(hints)
@@ -217,8 +224,8 @@ func (a *App) rebuildTable() {
 	a.table = t
 }
 
-func Run(db *sql.DB) error {
-	app := NewApp(db)
+func Run(db *sql.DB, ingestFn func() error, autoIngest bool) error {
+	app := NewApp(db, ingestFn, autoIngest)
 	p := tea.NewProgram(app, tea.WithAltScreen())
 	_, err := p.Run()
 	return err
