@@ -21,9 +21,15 @@ import (
 
 // State tracks ingest progress across runs.
 type State struct {
-	Path   string
-	Inode  uint64
-	Offset int64
+	Path          string                     `json:"path"`
+	Inode         uint64                     `json:"inode"`
+	Offset        int64                      `json:"offset"`
+	SessionCursor map[string]sessionProgress `json:"discord_sessions,omitempty"`
+}
+
+type sessionProgress struct {
+	Inode  uint64 `json:"inode"`
+	Offset int64  `json:"offset"`
 }
 
 // ReadState reads the state file (path\tinode\toffset).
@@ -35,19 +41,50 @@ func ReadState(stateFile string) (*State, error) {
 		}
 		return nil, err
 	}
-	parts := strings.Split(strings.TrimSpace(string(data)), "\t")
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" {
+		return &State{SessionCursor: map[string]sessionProgress{}}, nil
+	}
+
+	if strings.HasPrefix(trimmed, "{") {
+		var st State
+		if err := json.Unmarshal([]byte(trimmed), &st); err != nil {
+			return nil, err
+		}
+		if st.SessionCursor == nil {
+			st.SessionCursor = map[string]sessionProgress{}
+		}
+		return &st, nil
+	}
+
+	parts := strings.Split(trimmed, "\t")
 	if len(parts) < 3 {
-		return &State{}, nil
+		return &State{SessionCursor: map[string]sessionProgress{}}, nil
 	}
 	inode, _ := strconv.ParseUint(parts[1], 10, 64)
 	offset, _ := strconv.ParseInt(parts[2], 10, 64)
-	return &State{Path: parts[0], Inode: inode, Offset: offset}, nil
+	return &State{
+		Path:          parts[0],
+		Inode:         inode,
+		Offset:        offset,
+		SessionCursor: map[string]sessionProgress{},
+	}, nil
 }
 
 // WriteState persists state to disk.
-func WriteState(stateFile string, path string, inode uint64, size int64) error {
-	content := fmt.Sprintf("%s\t%d\t%d\n", path, inode, size)
-	return os.WriteFile(stateFile, []byte(content), 0644)
+func WriteState(stateFile string, st *State) error {
+	if st == nil {
+		st = &State{}
+	}
+	if st.SessionCursor == nil {
+		st.SessionCursor = map[string]sessionProgress{}
+	}
+	b, err := json.Marshal(st)
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	return os.WriteFile(stateFile, b, 0644)
 }
 
 // fileInode returns the inode of a file.
@@ -102,6 +139,9 @@ func IngestOnce(db *sql.DB, cfg *config.Config, sourceFile string) error {
 	if err != nil {
 		return fmt.Errorf("read state: %w", err)
 	}
+	if state.SessionCursor == nil {
+		state.SessionCursor = map[string]sessionProgress{}
+	}
 	minTs := int64(0)
 	if state.Path == sourceFile && state.Inode == localInode {
 		minTs = lastIngestedTs(db)
@@ -109,34 +149,40 @@ func IngestOnce(db *sql.DB, cfg *config.Config, sourceFile string) error {
 
 	// Determine start offset
 	startByte := int64(0)
+	sourceHasNewData := true
 	if state.Path == sourceFile && state.Inode == localInode && state.Offset <= localSize {
 		if localSize <= state.Offset {
-			// No new data
-			return WriteState(cfg.StateFile, sourceFile, localInode, localSize)
+			sourceHasNewData = false
 		}
-		startByte = state.Offset - cfg.IngestLookbackBytes
-		if startByte < 0 {
-			startByte = 0
-		}
-	}
-
-	f, err := os.Open(sourceFile)
-	if err != nil {
-		return fmt.Errorf("open source: %w", err)
-	}
-	defer f.Close()
-
-	if startByte > 0 {
-		if _, err := f.Seek(startByte, io.SeekStart); err != nil {
-			return fmt.Errorf("seek: %w", err)
+		if sourceHasNewData {
+			startByte = state.Offset - cfg.IngestLookbackBytes
+			if startByte < 0 {
+				startByte = 0
+			}
 		}
 	}
 
-	events, err := parseStream(f)
-	if err != nil {
-		return fmt.Errorf("parse stream: %w", err)
+	events := make([]model.Event, 0, 256)
+	if sourceHasNewData {
+		f, err := os.Open(sourceFile)
+		if err != nil {
+			return fmt.Errorf("open source: %w", err)
+		}
+		defer f.Close()
+
+		if startByte > 0 {
+			if _, err := f.Seek(startByte, io.SeekStart); err != nil {
+				return fmt.Errorf("seek: %w", err)
+			}
+		}
+
+		streamEvents, err := parseStream(f)
+		if err != nil {
+			return fmt.Errorf("parse stream: %w", err)
+		}
+		events = append(events, streamEvents...)
 	}
-	sessionEvents, err := parseDiscordSessionEvents(minTs)
+	sessionEvents, err := parseDiscordSessionEvents(minTs, state)
 	if err == nil && len(sessionEvents) > 0 {
 		events = append(events, sessionEvents...)
 	}
@@ -158,7 +204,10 @@ func IngestOnce(db *sql.DB, cfg *config.Config, sourceFile string) error {
 		}
 	}
 
-	return WriteState(cfg.StateFile, sourceFile, localInode, localSize)
+	state.Path = sourceFile
+	state.Inode = localInode
+	state.Offset = localSize
+	return WriteState(cfg.StateFile, state)
 }
 
 // lastIngestedTs returns the maximum ts_unix_ms in the events table.
@@ -903,10 +952,16 @@ type ocSessionLine struct {
 	} `json:"message"`
 }
 
-func parseDiscordSessionEvents(minTs int64) ([]model.Event, error) {
+func parseDiscordSessionEvents(minTs int64, state *State) ([]model.Event, error) {
 	stateDir := resolveOpenClawStateDir()
 	if stateDir == "" {
 		return nil, fmt.Errorf("openclaw state dir not found")
+	}
+	if state == nil {
+		state = &State{}
+	}
+	if state.SessionCursor == nil {
+		state.SessionCursor = map[string]sessionProgress{}
 	}
 	indexPaths, err := filepath.Glob(filepath.Join(stateDir, "agents", "*", "sessions", "sessions.json"))
 	if err != nil || len(indexPaths) == 0 {
@@ -914,6 +969,7 @@ func parseDiscordSessionEvents(minTs int64) ([]model.Event, error) {
 	}
 
 	events := make([]model.Event, 0, 128)
+	seen := map[string]bool{}
 	for _, indexPath := range indexPaths {
 		data, err := os.ReadFile(indexPath)
 		if err != nil {
@@ -936,11 +992,19 @@ func parseDiscordSessionEvents(minTs int64) ([]model.Event, error) {
 			if !filepath.IsAbs(sessionPath) {
 				sessionPath = filepath.Join(baseDir, sessionPath)
 			}
-			ev, err := parseDiscordSessionFile(sessionPath, minTs)
+			seen[sessionPath] = true
+			cursor := state.SessionCursor[sessionPath]
+			ev, nextCursor, err := parseDiscordSessionFile(sessionPath, minTs, cursor)
 			if err != nil {
 				continue
 			}
+			state.SessionCursor[sessionPath] = nextCursor
 			events = append(events, ev...)
+		}
+	}
+	for path := range state.SessionCursor {
+		if !seen[path] {
+			delete(state.SessionCursor, path)
 		}
 	}
 	return events, nil
@@ -959,12 +1023,28 @@ func resolveOpenClawStateDir() string {
 	return ""
 }
 
-func parseDiscordSessionFile(path string, minTs int64) ([]model.Event, error) {
+func parseDiscordSessionFile(path string, minTs int64, cursor sessionProgress) ([]model.Event, sessionProgress, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, cursor, err
+	}
+	inode := inodeFromFileInfo(info)
+	size := info.Size()
+	startOffset := int64(0)
+	if cursor.Inode == inode && cursor.Offset >= 0 && cursor.Offset <= size {
+		startOffset = cursor.Offset
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, cursor, err
 	}
 	defer f.Close()
+	if startOffset > 0 {
+		if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
+			return nil, cursor, err
+		}
+	}
 
 	events := make([]model.Event, 0, 32)
 	sc := bufio.NewScanner(f)
@@ -1046,7 +1126,14 @@ func parseDiscordSessionFile(path string, minTs int64) ([]model.Event, error) {
 		}
 	}
 
-	return events, sc.Err()
+	if err := sc.Err(); err != nil {
+		return nil, cursor, err
+	}
+	nextOffset, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		nextOffset = size
+	}
+	return events, sessionProgress{Inode: inode, Offset: nextOffset}, nil
 }
 
 func extractSessionText(content []struct {
