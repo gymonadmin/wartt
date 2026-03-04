@@ -28,8 +28,10 @@ type State struct {
 }
 
 type sessionProgress struct {
-	Inode  uint64 `json:"inode"`
-	Offset int64  `json:"offset"`
+	Inode          uint64 `json:"inode"`
+	Offset         int64  `json:"offset"`
+	PendingTraceID string `json:"pending_trace_id,omitempty"`
+	PendingTs      int64  `json:"pending_ts,omitempty"`
 }
 
 // ReadState reads the state file (path\tinode\toffset).
@@ -1031,7 +1033,8 @@ func parseDiscordSessionFile(path string, minTs int64, cursor sessionProgress) (
 	inode := inodeFromFileInfo(info)
 	size := info.Size()
 	startOffset := int64(0)
-	if cursor.Inode == inode && cursor.Offset >= 0 && cursor.Offset <= size {
+	sameFile := cursor.Inode == inode
+	if sameFile && cursor.Offset >= 0 && cursor.Offset <= size {
 		startOffset = cursor.Offset
 	}
 
@@ -1055,6 +1058,9 @@ func parseDiscordSessionFile(path string, minTs int64, cursor sessionProgress) (
 		ts      int64
 	}
 	var pending *pendingInbound
+	if sameFile && cursor.PendingTraceID != "" && cursor.PendingTs > 0 {
+		pending = &pendingInbound{traceID: cursor.PendingTraceID, ts: cursor.PendingTs}
+	}
 
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -1133,7 +1139,12 @@ func parseDiscordSessionFile(path string, minTs int64, cursor sessionProgress) (
 	if err != nil {
 		nextOffset = size
 	}
-	return events, sessionProgress{Inode: inode, Offset: nextOffset}, nil
+	next := sessionProgress{Inode: inode, Offset: nextOffset}
+	if pending != nil {
+		next.PendingTraceID = pending.traceID
+		next.PendingTs = pending.ts
+	}
+	return events, next, nil
 }
 
 func extractSessionText(content []struct {
