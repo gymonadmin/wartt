@@ -207,8 +207,23 @@ install_layout() {
 prepare_runtime_dir() {
   log "Preparing runtime log dir ${LOG_DIR}"
   as_root mkdir -p "${LOG_DIR}"
-  if [[ -n "${SUDO_USER:-}" ]]; then
-    as_root chown "${SUDO_USER}:${SUDO_USER}" "${LOG_DIR}" || true
+  local owner="${WARTT_LOG_OWNER:-}"
+  if [[ -z "${owner}" && -n "${SUDO_USER:-}" ]]; then
+    owner="${SUDO_USER}"
+  fi
+  if [[ -z "${owner}" && "$(id -u)" -ne 0 ]]; then
+    owner="$(id -un)"
+  fi
+  if [[ -z "${owner}" && "$(id -u)" -eq 0 ]]; then
+    local script_owner
+    script_owner="$(stat -c '%U' "${SCRIPT_DIR}" 2>/dev/null || true)"
+    if [[ -n "${script_owner}" && "${script_owner}" != "root" ]]; then
+      owner="${script_owner}"
+    fi
+  fi
+  if [[ -n "${owner}" ]]; then
+    log "Setting ownership on ${LOG_DIR} to ${owner}:${owner}"
+    as_root chown -R "${owner}:${owner}" "${LOG_DIR}" || true
   fi
 }
 

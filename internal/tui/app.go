@@ -58,7 +58,7 @@ func (a *App) Init() tea.Cmd {
 }
 
 func tick() tea.Cmd {
-	return tea.Tick(10*time.Second, func(t time.Time) tea.Msg {
+	return tea.Tick(5*time.Second, func(t time.Time) tea.Msg {
 		return tickMsg{}
 	})
 }
